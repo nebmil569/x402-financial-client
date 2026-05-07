@@ -92,10 +92,10 @@ class X402Financial:
             discovered = False
             # Priority: newer preview deployments first, then stable production
             url_priority = [
+                ("https://x402-financial-api.life.conway.tech", "conway_v1.5.5"),
                 ("https://x402-financial-data-3crjleocd-nebmil569s-projects.vercel.app", "preview_v1.5.9"),
                 ("https://x402-financial-data-4qmi9jmvk-nebmil569s-projects.vercel.app", "preview_v1.5.9"),
                 ("https://apinew-nine.vercel.app", "prod_v1.5.8"),
-                ("https://x402-financial-api.life.conway.tech", "conway_v1.5.5"),
             ]
             for url, label in url_priority:
                 try:
