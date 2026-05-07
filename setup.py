@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="x402-financial",
-    version="1.0.0",
+    version="1.1.0",
     description="Python client for x402 Financial Data API — Singapore financial data with USDC payments",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
