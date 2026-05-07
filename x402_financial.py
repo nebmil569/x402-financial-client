@@ -27,11 +27,12 @@ import os
 import requests
 from typing import Optional, List, Dict, Any, Union
 
-# PRIMARY: Conway (v1.5.5, 43 prices, LIVE)
-# SECONDARY: apinew-nine Vercel (v1.5.8, 47 prices, LIVE)
+# PRIMARY: apinew-nine Vercel (v1.5.8, 47 prices, MOST COMPLETE — use this one)
+# SECONDARY: Conway (v1.5.5, 43 prices, 14 endpoints behind)
+# TERTIARY: Vercel old (v1.5.7-rc1, 45 prices)
 BASE_URLS = [
-    "https://x402-financial-api.life.conway.tech",  # PRIMARY — Conway, stable
-    "https://apinew-nine.vercel.app",  # SECONDARY — Vercel, 47 endpoints
+    "https://apinew-nine.vercel.app",  # PRIMARY — Vercel, 47 prices, all new endpoints
+    "https://x402-financial-api.life.conway.tech",  # SECONDARY — Conway stable
     "https://x402-financial-data-api.vercel.app",  # TERTIARY — Vercel old
 ]
 NETWORK = "eip155:8453"
