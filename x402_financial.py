@@ -10,7 +10,7 @@ SGX stock data, CPF/SRS/FIRE calculators, tax, property, and more.
 Usage:
     from x402_financial import X402Financial
     client = X402Financial()
-    
+
     # Auto-discovers best available endpoint
     result = client.salary_net(gross_annual=80000)
     result = client.sgx_stock("DBS")
@@ -23,14 +23,16 @@ PyPI: https://pypi.org/project/x402-financial
 import base64
 import json
 import time
+import os
 import requests
 from typing import Optional, List, Dict, Any, Union
 
+# PRIMARY: Conway (v1.5.5, 43 prices, LIVE)
+# SECONDARY: apinew-nine Vercel (v1.5.8, 47 prices, LIVE)
 BASE_URLS = [
-    "https://x402-financial-data-3crjleocd-nebmil569s-projects.vercel.app",  # latest preview (v1.5.9)
-    "https://x402-financial-data-4qmi9jmvk-nebmil569s-projects.vercel.app",  # latest preview (v1.5.9)
-    "https://apinew-nine.vercel.app",  # stable production (v1.5.8)
-    "https://x402-financial-api.life.conway.tech",  # Conway legacy
+    "https://x402-financial-api.life.conway.tech",  # PRIMARY — Conway, stable
+    "https://apinew-nine.vercel.app",  # SECONDARY — Vercel, 47 endpoints
+    "https://x402-financial-data-api.vercel.app",  # TERTIARY — Vercel old
 ]
 NETWORK = "eip155:8453"
 ASSET = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # USDC on Base
@@ -49,17 +51,17 @@ class X402PaymentError(Exception):
 class X402Financial:
     """
     Python client for x402 Financial Data API.
-    
+
     Auto-discovers best available endpoint on init. Handles x402 v2 payment
     protocol automatically — pay with USDC on Base.
-    
+
     Usage:
         client = X402Financial(wallet_seed=bytes_or_hex)
         result = client.salary_net(gross_annual=80000)
         result = client.sgx_stock("DBS")
         result = client.invest_dca(monthly_investment=500, years=10)
     """
-    
+
     def __init__(
         self,
         wallet_seed: Optional[Union[str, bytes]] = None,
@@ -69,7 +71,7 @@ class X402Financial:
     ):
         """
         Initialize the client. Auto-discovers best available API endpoint.
-        
+
         Args:
             wallet_seed: Wallet private key (bytes or hex str).
                          If not provided, uses environment WALLET_SEED.
@@ -78,721 +80,719 @@ class X402Financial:
             api_key: Optional API key for x402 header
         """
         self.timeout = timeout
-        self._session = requests.Session()
-        self._session.headers.update({"Content-Type": "application/json"})
-        if api_key:
-            self._session.headers["X-API-Key"] = api_key
-        
-        # Multi-endpoint fallback discovery
-        if base_url:
-            self.base_url = base_url.rstrip('/')
-            self._deploy_url = self.base_url
-            self._discover()
-        else:
-            discovered = False
-            # Priority: newer preview deployments first, then stable production
-            url_priority = [
-                ("https://x402-financial-api.life.conway.tech", "conway_v1.5.5"),
-                ("https://x402-financial-data-3crjleocd-nebmil569s-projects.vercel.app", "preview_v1.5.9"),
-                ("https://x402-financial-data-4qmi9jmvk-nebmil569s-projects.vercel.app", "preview_v1.5.9"),
-                ("https://apinew-nine.vercel.app", "prod_v1.5.8"),
-            ]
-            for url, label in url_priority:
-                try:
-                    resp = self._session.get(f"{url}/health", timeout=5)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        version = data.get("version", "unknown")
-                        # Use the URL that actually responds (prefer newer deployments)
-                        self.base_url = url
-                        self._deploy_url = url
-                        self._version = version
-                        # api_base_url from health may be legacy — trust our direct URL more
-                        self._endpoints = {}
-                        self._prices = {}
-                        self._discover()
-                        discovered = True
-                        break
-                except Exception:
-                    continue
-            
-            if not discovered:
-                self.base_url = "https://x402-financial-api.life.conway.tech"
-                self._deploy_url = self.base_url
-                self._version = "unknown"
-                self._endpoints = {}
-                self._prices = {}
-        
-        # Wallet
-        self.wallet_seed = None
-        if wallet_seed:
-            seed_hex = wallet_seed if isinstance(wallet_seed, str) else wallet_seed.hex()
-            self.wallet_seed = bytes.fromhex(seed_hex.lstrip('0x'))
-    
-    def _discover(self):
-        """Fetch and cache endpoint manifest (normalize full URLs to paths)."""
-        try:
-            resp = self._session.get(f"{self.base_url}/x402.json", timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                for ep in data.get("endpoints", []):
-                    full_url = ep.get("url", "")
-                    if full_url:
-                        # Extract path from full URL (e.g. "https://host/path" -> "/path")
-                        # Handle Vercel preview URLs (full URL as url field)
-                        parsed = full_url.split(self.base_url, 1)
-                        path = parsed[1] if len(parsed) > 1 else full_url
-                        if not path.startswith('/'):
-                            path = '/' + path
-                        ep["_path"] = path  # normalized path key
-                        self._endpoints[path] = ep
-                self._prices = {
-                    ep.get("_path", ep.get("url", "")): ep.get("price_usd", ep.get("pricing", {}).get("amount", "0"))
-                    for ep in data.get("endpoints", [])
-                }
-        except Exception:
-            pass
-    
-    def _make_request(self, method: str, path: str, data: dict = None) -> dict:
-        """
-        Make an x402-enabled request.
-        
-        1. Make the request (will get 402 if payment required)
-        2. Parse 402 response for payment requirements
-        3. Sign and execute payment
-        4. Retry with payment header
-        """
-        url = f"{self.base_url}{path}"
-        headers = {}
-        
-        # First attempt
-        if method == "GET":
-            resp = self._session.request("GET", url, params=data, timeout=self.timeout)
-        else:
-            resp = self._session.request(method, url, json=data, timeout=self.timeout)
-        
-        # Handle 402 Payment Required
-        if resp.status_code == 402:
-            payment_spec = resp.json()
-            
-            if not self.wallet_seed:
-                error = payment_spec.get("error", {})
-                accepts = error.get("accepts", error.get("error", {}).get("accepts", []))
-                if accepts:
-                    req = accepts[0]
-                    raise X402PaymentError(
-                        f"Payment required: {req.get('amount')} USDC on {req.get('network','base')}",
-                        required_amount=req.get("amount"),
-                        network=req.get("network", NETWORK),
-                        asset=ASSET
-                    )
-                raise X402PaymentError("Payment required but no wallet configured")
-            
-            # Extract payment requirements from 402 response
-            error = payment_spec.get("error", {})
-            x402_err = error.get("error", error)
-            accepts = x402_err.get("accepts", [])
-            
-            if not accepts:
-                raise X402PaymentError("Payment required but no payment spec in 402 response")
-            
-            pay_spec = accepts[0]
-            amount = pay_spec.get("amount")
-            pay_to = pay_spec.get("pay_to", WALLET)
-            network = pay_spec.get("network", NETWORK)
-            scheme = pay_spec.get("scheme", "exact")
-            
-            if scheme != "exact":
-                raise X402PaymentError(f"Unsupported payment scheme: {scheme}")
-            
-            # Sign payment using Coinbase SDK
-            try:
-                from coinbase.types import SignedContent
-                from coinbase.advanced_api.exchange import sign_content
-                from coinbase.crypto import CryptoKeyPair
-                from coinbase.advanced_api.key_storage import InMemoryStorage
-                
-                key = CryptoKeyPair.from_seed(self.wallet_seed)
-                storage = InMemoryStorage({key.address: key})
-                
-                # Build payment payload
-                payment_payload = {
-                    "payment": {
-                        "amount": amount,
-                        "network": network,
-                        "pay_to": pay_to,
-                        "asset": ASSET,
-                    }
-                }
-                
-                payload_json = json.dumps(payment_payload, separators=(',', ':'))
-                payload_bytes = payload_json.encode('utf-8')
-                
-                from coinbase.crypto import sign_message
-                signature = sign_message(payload_bytes, key)
-                sig_hex = signature.hex() if isinstance(signature, bytes) else signature
-                
-                token_payload = {
-                    "data": {
-                        "payment": {
-                            "amount": amount,
-                            "network": network,
-                            "pay_to": pay_to,
-                            "asset": ASSET,
-                            "signature": sig_hex,
-                            "signer": key.address,
-                        }
-                    }
-                }
-                
-                auth_token = base64.b64encode(
-                    json.dumps(token_payload, separators=(',', ':')).encode('utf-8')
-                ).decode('utf-8')
-                
-                headers["Authorization"] = f"Bearer {auth_token}"
-                
-            except ImportError:
-                raise X402PaymentError(
-                    "coinbase-mdp-sdk not installed. Run: pip install coinbase-mdp-sdk",
-                    required_amount=amount,
-                    network=network,
-                    asset=ASSET
-                )
-            
-            # Retry with payment
-            if method == "GET":
-                resp = self._session.request("GET", url, params=data, headers=headers, timeout=self.timeout)
-            else:
-                resp = self._session.request(method, url, json=data, headers=headers, timeout=self.timeout)
-        
-        if resp.status_code != 200:
-            raise Exception(f"API error {resp.status_code}: {resp.text[:300]}")
-        
-        return resp.json()
-    
-    @property
-    def endpoints(self) -> List[str]:
-        """List all available endpoint paths (normalized, e.g. '/parse/{bank}')."""
-        return sorted(getattr(self, '_endpoints', {}).keys())
-    
-    @property
-    def api_version(self) -> str:
-        """API version (discovered on init)."""
-        return getattr(self, '_version', 'unknown')
+        self._api_key = api_key or os.environ.get("X402_API_KEY")
 
-    # =====================
-    # BANK PARSING
-    # =====================
-    
-    def parse_statement(self, bank: str, pdf_data: Union[str, bytes], bank_type: str = "bank") -> dict:
+        # Wallet setup
+        if wallet_seed is None:
+            wallet_seed = os.environ.get("WALLET_SEED")
+        if wallet_seed:
+            self._wallet_seed = bytes.fromhex(wallet_seed.strip("0x")) if isinstance(wallet_seed, str) else wallet_seed
+        else:
+            self._wallet_seed = None
+
+        # Auto-discover or use override
+        if base_url:
+            self.base_url = base_url.rstrip("/")
+            self._endpoint_version = "user-specified"
+        else:
+            self.base_url = self._discover_endpoint()
+            self._endpoint_version = "auto-discovered"
+
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
+        if self._api_key:
+            self.session.headers["X-API-Key"] = self._api_key
+
+        # Cache for endpoints
+        self._endpoints_cache = None
+
+    def _discover_endpoint(self) -> str:
+        """Auto-discover the best available API endpoint."""
+        for url in BASE_URLS:
+            try:
+                resp = self.session.get(f"{url}/health", timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    version = data.get("version", "?")
+                    prices_count = len(data.get("prices", {}))
+                    print(f"[x402-financial] Discovered {url} (v{version}, {prices_count} prices)")
+                    return url
+            except Exception:
+                continue
+        # Fallback to primary
+        return BASE_URLS[0]
+
+    @property
+    def endpoints(self) -> Dict[str, Any]:
+        """Cache and return the /prices catalog."""
+        if self._endpoints_cache is None:
+            try:
+                resp = self.session.get(f"{self.base_url}/prices", timeout=10)
+                if resp.status_code == 200:
+                    self._endpoints_cache = resp.json()
+                else:
+                    self._endpoints_cache = {}
+            except Exception:
+                self._endpoints_cache = {}
+        return self._endpoints_cache
+
+    def _make_request(self, method: str, path: str, data: Optional[Dict] = None,
+                     include_payment: bool = True) -> Dict[str, Any]:
+        """Make an authenticated x402 request with payment."""
+        url = f"{self.base_url}{path}"
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["X-API-Key"] = self._api_key
+
+        body = data.copy() if data else {}
+        body["_wallet"] = self._wallet_seed.hex() if self._wallet_seed else None
+
+        resp = self.session.request(method, url, json=body, headers=headers, timeout=self.timeout)
+        return resp
+
+    def health(self) -> Dict[str, Any]:
+        """Get API health and version info."""
+        resp = self.session.get(f"{self.base_url}/health", timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ===== PRICING HELPERS =====
+
+    def _get_price(self, path: str) -> Optional[float]:
+        """Get price for an endpoint from prices catalog."""
+        endpoints = self.endpoints.get("paid_endpoints", [])
+        for ep in endpoints:
+            if ep.get("path") == path:
+                price_str = ep.get("price", "0").replace("$", "").replace(" USDC", "")
+                try:
+                    return float(price_str)
+                except:
+                    return None
+        return None
+
+    # ===== BANK PARSING =====
+
+    def parse_bank_statement(self, bank: str, pdf_data: Union[str, bytes]) -> Dict[str, Any]:
         """
-        Parse a bank statement PDF. Supports 9 Singapore banks.
-        
+        Parse a bank statement PDF.
+
         Args:
-            bank: Bank identifier (dbs, posb, ocbc, uob, citi, maybank, standchart, trust, boc)
-            pdf_data: base64-encoded PDF or raw bytes
-            bank_type: 'bank' or 'credit_card' (default: 'bank')
-        
-        Example:
-            result = client.parse_statement("dbs", pdf_base64)
+            bank: One of dbs, posb, ocbc, uob, citi, maybank, standchart, trust, boc
+            pdf_data: Base64-encoded PDF string or raw bytes
+
+        Returns:
+            Parsed transactions array
         """
         if isinstance(pdf_data, bytes):
-            pdf_data = base64.b64encode(pdf_data).decode('utf-8')
-        return self._make_request("POST", f"/parse/{bank}", {
-            "data": pdf_data,
-            "bank_type": bank_type,
-        })
-    
-    def extract_transactions(self, transactions: List[Dict]) -> dict:
+            pdf_data = base64.b64encode(pdf_data).decode()
+
+        body = {"data": pdf_data}
+        resp = self._make_request("POST", f"/parse/{bank}", body)
+        if resp.status_code == 402:
+            raise X402PaymentError(
+                "Payment required",
+                required_amount=self._get_price(f"/parse/{bank}"),
+                network=NETWORK,
+                asset=ASSET,
+            )
+        resp.raise_for_status()
+        return resp.json()
+
+    def extract_transactions(self, transactions: List[Dict]) -> Dict[str, Any]:
+        """AI entity extraction + categorization from raw transactions."""
+        body = {"transactions": transactions}
+        resp = self._make_request("POST", "/extract/transactions", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/extract/transactions"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ===== FINANCIAL REPORTS =====
+
+    def summary(self, transactions: List[Dict], person_name: Optional[str] = None) -> Dict[str, Any]:
+        """AI financial summary with spending breakdown."""
+        body = {"transactions": transactions}
+        if person_name:
+            body["person_name"] = person_name
+        resp = self._make_request("POST", "/summary", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/summary"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def spending_report(self, transactions: List[Dict]) -> Dict[str, Any]:
+        """Detailed expense report with Singapore budget benchmarks."""
+        body = {"transactions": transactions}
+        resp = self._make_request("POST", "/report/spending", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/report/spending"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def cash_flow_report(self, transactions: List[Dict]) -> Dict[str, Any]:
+        """Monthly income vs expenses analysis with savings rate."""
+        body = {"transactions": transactions}
+        resp = self._make_request("POST", "/report/cash-flow", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/report/cash-flow"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def subscriptions_report(self, transactions: List[Dict]) -> Dict[str, Any]:
+        """AI-powered subscription detection with annual cost estimates."""
+        body = {"transactions": transactions}
+        resp = self._make_request("POST", "/report/subscriptions", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/report/subscriptions"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def billing_calendar(self, transactions: List[Dict], person_name: Optional[str] = None) -> Dict[str, Any]:
+        """Forward-looking billing calendar — projects recurring charges 3 months ahead."""
+        body = {"transactions": transactions}
+        if person_name:
+            body["person_name"] = person_name
+        resp = self._make_request("POST", "/report/billing-calendar", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/report/billing-calendar"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def financial_insights(self, transactions: List[Dict], person_name: Optional[str] = None,
+                          months: int = 3) -> Dict[str, Any]:
+        """Personalized AI financial insights with Singapore-specific tips."""
+        body = {"transactions": transactions, "months": months}
+        if person_name:
+            body["person_name"] = person_name
+        resp = self._make_request("POST", "/report/insights", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/report/insights"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ===== SALARY & TAX =====
+
+    def salary_net(self, gross_annual: float, employer_cpf: float = None,
+                   bonus: float = 0, form_type: str = "S1") -> Dict[str, Any]:
         """
-        AI-powered transaction entity extraction + categorization.
-        
+        Singapore take-home salary calculator.
+
         Args:
-            transactions: List of dicts with at least {'description': str}
-        
-        Returns merchant names, categories, locations, entity types.
+            gross_annual: Annual gross salary (SGD)
+            employer_cpf: Optional employer CPF contribution override
+            bonus: Annual bonus (SGD)
+            form_type: S1 (citizen/PR employed) or NA (foreigner/self-employed)
         """
-        return self._make_request("POST", "/extract/transactions", {"transactions": transactions})
-    
-    def summarize(self, transactions: List[Dict]) -> dict:
-        """
-        Generate AI financial summary from transactions.
-        
-        Returns: spending breakdown, recurring charges, monthly trends, savings rate.
-        """
-        return self._make_request("POST", "/summary", {"transactions": transactions})
-    
-    def spending_report(self, transactions: List[Dict]) -> dict:
-        """Monthly spending report by category."""
-        return self._make_request("POST", "/report/spending", {"transactions": transactions})
-    
-    def cash_flow(self, transactions: List[Dict]) -> dict:
-        """Cash flow report — income vs expenses."""
-        return self._make_request("POST", "/report/cash_flow", {"transactions": transactions})
-    
-    def subscriptions(self, transactions: List[Dict]) -> dict:
-        """Detect recurring subscriptions and generate billing calendar."""
-        return self._make_request("POST", "/report/subscriptions", {"transactions": transactions})
-    
-    # =====================
-    # SGX STOCK DATA
-    # =====================
-    
-    def sgx_stock(self, symbol: str) -> dict:
-        """
-        SGX stock fundamentals — price, PE, dividend, market cap, 52w range.
-        
-        Args:
-            symbol: SGX ticker (e.g., 'DBS', 'OCBC', 'UOB', 'D05', 'BN4')
-        """
-        return self._make_request("POST", "/sgx/stock", {"symbol": symbol.upper()})
-    
-    def sgx_price(self, symbol: str) -> dict:
-        """Real-time SGX stock price from Yahoo Finance."""
-        return self._make_request("POST", "/sgx/price", {"symbol": symbol.upper()})
-    
-    def sgx_dividend(self, symbol: str) -> dict:
-        """Dividend data: annual DPS, yield, frequency, next ex-date/pay_date."""
-        return self._make_request("POST", "/sgx/dividend", {"symbol": symbol.upper()})
-    
-    def sgx_portfolio(self, symbols: List[str]) -> dict:
-        """Multi-stock portfolio summary with total value, dividends, fundamentals."""
-        return self._make_request("POST", "/sgx/portfolio", {"symbols": [s.upper() for s in symbols]})
-    
-    def sgx_screen(self, min_dividend_yield: float = 3.0, sort_by: str = "yield") -> dict:
-        """Screen SGX stocks by dividend yield. Returns filtered list with fundamentals."""
-        return self._make_request("POST", "/sgx/screen", {
-            "min_dividend_yield": min_dividend_yield,
-            "sort_by": sort_by,
-        })
-    
-    def sgx_search(self, query: str) -> dict:
-        """Search SGX stock database by company name or ticker."""
-        return self._make_request("POST", "/sgx/search", {"query": query})
-    
-    # =====================
-    # SALARY & TAX
-    # =====================
-    
-    def salary_net(self, gross_annual: float, is_local_employee: bool = True) -> dict:
-        """
-        Calculate Singapore net salary (take-home after CPF, SDL, IT).
-        
-        Args:
-            gross_annual: Annual gross salary in SGD
-            is_local_employee: True for Singapore citizens/PR (CPF), False for foreigners
-        """
-        return self._make_request("POST", "/salary/net", {
+        body = {
             "gross_annual": gross_annual,
-            "is_local_employee": is_local_employee,
-        })
-    
-    def salary_benchmark(self, occupation: str, age_group: str = "25-29",
-                         sector: str = "all", city: str = "singapore") -> dict:
-        """Singapore salary market rates by occupation (MOM-backed comparables)."""
-        return self._make_request("POST", "/salary/benchmark", {
-            "occupation": occupation,
-            "age_group": age_group,
-            "sector": sector,
-            "city": city,
-        })
-    
-    def tax_income(self, gross_annual: float, year_of_assessment: int = 2026,
-                   cpf_contributions: float = 0, donations: float = 0,
-                   course_fees: float = 0, srs_contributions: float = 0,
-                   mortgage_interest: float = 0, rental_income: float = 0,
-                   taxable_income_from_other: float = 0, tax_savings: float = 0) -> dict:
-        """
-        Singapore income tax calculator (YA 2025/2026).
-        Includes CPF, donations, course fees, SRS top-ups, mortgage interest deductions.
-        """
-        return self._make_request("POST", "/tax/income", {
-            "gross_annual": gross_annual,
-            "year_of_assessment": year_of_assessment,
+            "bonus": bonus,
+            "form_type": form_type,
+        }
+        if employer_cpf is not None:
+            body["employer_cpf"] = employer_cpf
+        resp = self._make_request("POST", "/salary/net", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/salary/net"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def salary_benchmark(self, annual_income: float, job_title: str = None,
+                        years_experience: int = None) -> Dict[str, Any]:
+        """Compare salary against Singapore market rates."""
+        body = {"annual_income": annual_income}
+        if job_title:
+            body["job_title"] = job_title
+        if years_experience is not None:
+            body["years_experience"] = years_experience
+        resp = self._make_request("POST", "/salary/benchmark", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/salary/benchmark"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def tax_income(self, gross_income: float, basic_income: float,
+                   cpf_contributions: float, year: int = 2024) -> Dict[str, Any]:
+        """Singapore income tax estimate using IRAS bands."""
+        body = {
+            "gross_income": gross_income,
+            "basic_income": basic_income,
             "cpf_contributions": cpf_contributions,
-            "donations": donations,
-            "course_fees": course_fees,
-            "srs_contributions": srs_contributions,
-            "mortgage_interest": mortgage_interest,
-            "rental_income": rental_income,
-            "taxable_income_from_other": taxable_income_from_other,
-            "tax_savings": tax_savings,
-        })
-    
-    def tax_corporate(self, chargeable_income: float) -> dict:
-        """Singapore corporate tax calculator (17% flat rate)."""
-        return self._make_request("POST", "/tax/corporate", {"chargeable_income": chargeable_income})
-    
-    # =====================
-    # CPF & RETIREMENT
-    # =====================
-    
+            "year": year,
+        }
+        resp = self._make_request("POST", "/tax/income", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/tax/income"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ===== SGX STOCKS =====
+
+    def sgx_stock(self, symbol: str, currency: str = "SGD") -> Dict[str, Any]:
+        """
+        Get SGX stock profile — price, dividend, PE, EPS, market cap.
+
+        Args:
+            symbol: SGX ticker (e.g. DBS, UOB, OCBC, CAPITALAND, SINGTEL)
+            currency: Display currency (default SGD)
+        """
+        body = {"symbol": symbol, "currency": currency}
+        resp = self._make_request("POST", "/sgx/stock", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/sgx/stock"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def sgx_price(self, symbol: str, currency: str = "SGD") -> Dict[str, Any]:
+        """Get real-time SGX stock price."""
+        body = {"symbol": symbol, "currency": currency}
+        resp = self._make_request("POST", "/sgx/price", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/sgx/price"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def sgx_dividend(self, symbol: str) -> Dict[str, Any]:
+        """Get dividend data for SGX stock — annual dividend, yield, EPS, PE."""
+        body = {"symbol": symbol}
+        resp = self._make_request("POST", "/sgx/dividend", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/sgx/dividend"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def sgx_portfolio(self, symbols: List[str]) -> Dict[str, Any]:
+        """Batch lookup for up to 20 SGX stocks."""
+        body = {"symbols": symbols}
+        resp = self._make_request("POST", "/sgx/portfolio", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/sgx/portfolio"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def sgx_screen(self, min_dividend_yield: float = 0,
+                   min_price: float = 0) -> Dict[str, Any]:
+        """Dividend screener for SGX stocks."""
+        body = {"min_dividend_yield": min_dividend_yield, "min_price": min_price}
+        resp = self._make_request("POST", "/sgx/screen", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/sgx/screen"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ===== CPF & RETIREMENT =====
+
     def cpf_calculator(self, age: int, basic_salary: float,
-                       bonus: float = 0, full_cpf: bool = True) -> dict:
-        """
-        CPF contribution calculator for Singapore residents.
-        
-        Args:
-            age: Employee age (55 or below for full contributions)
-            basic_salary: Monthly basic salary (SGD)
-            bonus: Monthly bonus (SGD)
-            full_cpf: True if both employer/employee contributions apply
-        """
-        return self._make_request("POST", "/cpf/calculator", {
+                       cpf_contribution_rate: float = 37) -> Dict[str, Any]:
+        """Project CPF balances (OA/SA/RA) at retirement."""
+        body = {
             "age": age,
             "basic_salary": basic_salary,
-            "bonus": bonus,
-            "full_cpf": full_cpf,
-        })
-    
-    def cpf_contributions(self, basic_salary: float, age: int,
-                          bonus: float = 0) -> dict:
-        """ CPF contribution breakdown (employee + employer shares)."""
-        return self._make_request("POST", "/cpf/contributions", {
-            "basic_salary": basic_salary,
+            "cpf_contribution_rate": cpf_contribution_rate,
+        }
+        resp = self._make_request("POST", "/cpf/calculator", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/cpf/calculator"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def cpf_topup(self, age: int, citizenship: str, current_oa: float, current_sa: float,
+                  current_ra: float, voluntary_oa_amount: float = 0,
+                  voluntary_sa_amount: float = 0, voluntary_ra_amount: float = 0,
+                  expected_bonus: float = 0, current_annual_income: float = 0) -> Dict[str, Any]:
+        """CPF Voluntary Top-up Optimizer — tax savings, interest differential, FRS adequacy."""
+        body = {
             "age": age,
-            "bonus": bonus,
-        })
-    
-    def cpf_topup(self, age: int, cpf_balance: float, annual_income: float,
-                  ciws_topup: float = 0) -> dict:
-        """CPF Retirement Sum Top-Up (RSTU) calculator — tax relief benefits."""
-        return self._make_request("POST", "/cpf/topup", {
+            "citizenship": citizenship,
+            "current_oa": current_oa,
+            "current_sa": current_sa,
+            "current_ra": current_ra,
+            "voluntary_oa_amount": voluntary_oa_amount,
+            "voluntary_sa_amount": voluntary_sa_amount,
+            "voluntary_ra_amount": voluntary_ra_amount,
+            "expected_bonus": expected_bonus,
+            "current_annual_income": current_annual_income,
+        }
+        resp = self._make_request("POST", "/cpf/topup", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/cpf/topup"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def srs_calculator(self, age: int, annual_contribution: float, nationality: str,
+                       current_srs_balance: float = 0,
+                       withdrawal_age: int = 63) -> Dict[str, Any]:
+        """SRS calculator — tax savings, projected balance, retirement withdrawal estimates."""
+        body = {
             "age": age,
+            "annual_contribution": annual_contribution,
+            "nationality": nationality,
+            "current_srs_balance": current_srs_balance,
+            "withdrawal_age": withdrawal_age,
+        }
+        resp = self._make_request("POST", "/srs/calculator", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/srs/calculator"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def fire(self, age: int, annual_income: float, annual_expenses: float,
+             current_savings: float = 0, cpf_balance: float = 0,
+             target_retirement_age: int = 55) -> Dict[str, Any]:
+        """Singapore FIRE (Financial Independence / Retire Early) calculator."""
+        body = {
+            "age": age,
+            "annual_income": annual_income,
+            "annual_expenses": annual_expenses,
+            "current_savings": current_savings,
             "cpf_balance": cpf_balance,
-            "annual_income": annual_income,
-            "ciws_topup": ciws_topup,
-        })
-    
-    def srs_calculator(self, age: int, annual_income: float,
-                       cpf_savings: float = 0, retirement_age: int = 65) -> dict:
-        """
-        SRS (Supplementary Retirement Scheme) calculator.
-        Tax deduction on contributions, projected growth, retirement withdrawal tax.
-        """
-        return self._make_request("POST", "/srs/calculator", {
-            "age": age,
-            "annual_income": annual_income,
-            "cpf_savings": cpf_savings,
-            "retirement_age": retirement_age,
-        })
-    
-    def fire(self, age: int, annual_income: float, savings_rate: float = 0.5,
-             current_investments: float = 0, target_retirement_age: int = 55) -> dict:
-        """
-        Singapore FIRE (Financial Independence / Retire Early) calculator.
-        Combines CPF, SRS, and investment projections into a FIRE readiness score.
-        
-        Args:
-            age: Current age
-            annual_income: Annual gross income (SGD)
-            savings_rate: Fraction saved each year (0.0–1.0)
-            current_investments: Investable assets outside CPF/SRS (SGD)
-            target_retirement_age: Target retirement age (default 55)
-        """
-        return self._make_request("POST", "/fire", {
-            "age": age,
-            "annual_income": annual_income,
-            "savings_rate": savings_rate,
-            "current_investments": current_investments,
             "target_retirement_age": target_retirement_age,
-        })
-    
-    def savings_rates(self) -> dict:
-        """Compare savings account interest rates across Singapore banks."""
-        return self._make_request("GET", "/savings/rates", {})
-    
-    def savings_optimize(self, monthly_income: float, expenses: Dict[str, float],
-                         goals: List[Dict] = None) -> dict:
-        """Personalized savings optimization with goal-based recommendations."""
-        return self._make_request("POST", "/savings/optimize", {
-            "monthly_income": monthly_income,
-            "expenses": expenses,
-            "goals": goals or [],
-        })
-    
-    # =====================
-    # INVESTMENT
-    # =====================
-    
-    def invest_dca(self, monthly_investment: float, years: int,
-                   expected_return: float = 0.08, compare: str = "cpf_oa") -> dict:
-        """
-        Dollar Cost Averaging simulator — compare IWLU ETF vs CPF OA vs SSB.
-        
-        Args:
-            monthly_investment: SGD amount to invest monthly
-            years: Investment horizon
-            expected_return: Expected annual return (default 8%)
-            compare: Comparison mode — 'cpf_oa', 'ssb', 'all'
-        """
-        return self._make_request("POST", "/invest/dca", {
-            "monthly_investment": monthly_investment,
-            "years": years,
-            "expected_return": expected_return,
-            "compare": compare,
-        })
-    
-    def invest_grow(self, initial_amount: float, monthly_topup: float = 0,
-                    years: int = 10, expected_return: float = 0.08) -> dict:
-        """
-        Investment growth calculator — lump sum + recurring topup scenarios.
-        Compares CPF OA vs SA vs liquid investments.
-        """
-        return self._make_request("POST", "/invest/grow", {
-            "initial_amount": initial_amount,
-            "monthly_topup": monthly_topup,
-            "years": years,
-            "expected_return": expected_return,
-        })
-    
-    # =====================
-    # PROPERTY
-    # =====================
-    
-    def bto_affordability(self, annual_household_income: float,
-                          flat_type: str = "4-room", location: str = "any") -> dict:
-        """
-        BTO affordability calculator — estimated loan, monthly payment, eligible subsidy.
-        
-        Args:
-            annual_household_income: Combined annual household income (SGD)
-            flat_type: '2-room', '3-room', '4-room', '5-room', '3Gen'
-            location: 'north', 'northeast', 'east', 'west', 'central' or 'any'
-        """
-        return self._make_request("POST", "/bto/affordability", {
-            "annual_household_income": annual_household_income,
+        }
+        resp = self._make_request("POST", "/fire", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/fire"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def retirement_community(self, age: int, monthly_budget: float,
+                            prefer_active: bool = True) -> Dict[str, Any]:
+        """Singapore retirement community finder — care needs, budget, preferred location."""
+        body = {
+            "age": age,
+            "monthly_budget": monthly_budget,
+            "prefer_active": prefer_active,
+        }
+        resp = self._make_request("POST", "/retirement/community", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/retirement/community"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ===== PROPERTY =====
+
+    def hdb_resale(self, town: str, flat_type: str, floor: int = None,
+                   lease_start: int = None) -> Dict[str, Any]:
+        """Estimate HDB resale flat prices across 23 Singapore towns."""
+        body = {"town": town, "flat_type": flat_type}
+        if floor is not None:
+            body["floor"] = floor
+        if lease_start is not None:
+            body["lease_start"] = lease_start
+        resp = self._make_request("POST", "/hdb/resale", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/hdb/resale"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def hdb_resale_towns(self) -> Dict[str, Any]:
+        """List all 23 HDB towns with market indices."""
+        resp = self._make_request("POST", "/hdb/resale/towns", {})
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/hdb/resale/towns"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def bto_affordability(self, bto_price: float, monthly_household_income: float,
+                          flat_type: str = "4-room", town: str = "Unknown",
+                          applicant_age: int = 30, cpf_oa_balance: float = 0,
+                          other_debt_payments: float = 0) -> Dict[str, Any]:
+        """BTO affordability calculator — HDB loan vs bank loan, grants, BSD, CPF impact."""
+        body = {
+            "bto_price": bto_price,
+            "monthly_household_income": monthly_household_income,
             "flat_type": flat_type,
-            "location": location,
-        })
-    
-    def hdb_resale(self, town: str, flat_type: str = "4-room",
-                   storey_range: str = "10-19", lease: str = "99-year") -> dict:
-        """
-        HDB resale price estimate for a given town and flat type.
-        Uses recent transactions and market benchmarks.
-        """
-        return self._make_request("POST", "/hdb/resale", {
             "town": town,
-            "flat_type": flat_type,
-            "storey_range": storey_range,
-            "lease": lease,
-        })
-    
-    def property_tax(self, annual_value: float, owner_occupied: bool = True,
-                     property_type: str = "condo") -> dict:
-        """Singapore property tax calculator (AV-based, progressive rates)."""
-        return self._make_request("POST", "/property/tax", {
-            "annual_value": annual_value,
-            "owner_occupied": owner_occupied,
-            "property_type": property_type,
-        })
-    
-    def rental_yield(self, property_price: float, monthly_rent: float,
-                     property_type: str = "condo", district: str = "CCR") -> dict:
-        """
-        Singapore property rental yield calculator.
-        Returns gross yield, net yield (after fees), benchmark vs market averages.
-        """
-        return self._make_request("POST", "/property/rental-yield", {
+            "applicant_age": applicant_age,
+            "cpf_oa_balance": cpf_oa_balance,
+            "other_debt_payments": other_debt_payments,
+        }
+        resp = self._make_request("POST", "/bto/affordability", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/bto/affordability"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def property_tax(self, annual_value: float, property_type: str) -> Dict[str, Any]:
+        """Singapore property tax calculator — IRAS 2024 progressive rates."""
+        body = {"annual_value": annual_value, "property_type": property_type}
+        resp = self._make_request("POST", "/property/tax", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/property/tax"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def property_absd(self, purchase_price: float, buyer_type: str,
+                      ownership_count: int = 0, include_acd: bool = False) -> Dict[str, Any]:
+        """ABSD calculator — SC/PR/foreigner, 1st/2nd/3rd+ property."""
+        body = {
+            "purchase_price": purchase_price,
+            "buyer_type": buyer_type,
+            "ownership_count": ownership_count,
+            "include_acd": include_acd,
+        }
+        resp = self._make_request("POST", "/property/absd", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/property/absd"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def rental_yield(self, property_price: float, monthly_rent: float = None,
+                     property_type: str = "2bed", area_sqft: float = 1000,
+                     location: str = "singapore") -> Dict[str, Any]:
+        """Calculate gross/net rental yield for Singapore property."""
+        body = {
             "property_price": property_price,
             "monthly_rent": monthly_rent,
             "property_type": property_type,
-            "district": district,
-        })
-    
-    def mortgage_compare(self, property_price: float, loan_amount: float,
-                         loan_tenure_years: int = 20, interest_rate: float = 2.5,
-                         existing_loan: float = 0) -> dict:
-        """Compare mortgage options and estimate monthly payments."""
-        return self._make_request("POST", "/mortgage/compare", {
-            "property_price": property_price,
+            "area_sqft": area_sqft,
+            "location": location,
+        }
+        resp = self._make_request("POST", "/property/rental-yield", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/property/rental-yield"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def condo_maintenance(self, sqft: float, tier: str, floor: int = 10,
+                          has_lift: bool = True) -> Dict[str, Any]:
+        """Estimate Singapore condo monthly maintenance fees."""
+        body = {
+            "sqft": sqft,
+            "tier": tier,
+            "floor": floor,
+            "has_lift": has_lift,
+        }
+        resp = self._make_request("POST", "/property/condo-maintenance", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/property/condo-maintenance"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def mortgage_compare(self, loan_amount: float, tenure_years: int,
+                         rate: float, bank_or_hdb: str = "bank") -> Dict[str, Any]:
+        """Compare mortgage scenarios — bank vs HDB, different tenures/rates."""
+        body = {
+            "loan_amount": loan_amount,
+            "tenure_years": tenure_years,
+            "rate": rate,
+            "bank_or_hdb": bank_or_hdb,
+        }
+        resp = self._make_request("POST", "/mortgage/compare", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/mortgage/compare"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ===== INVESTMENT =====
+
+    def invest_dca(self, monthly_investment: float, years: int = 10,
+                   portfolio_type: str = "iwlu") -> Dict[str, Any]:
+        """Singapore DCA simulator — IWLU vs CPF OA vs SSB, 1-30yr projections."""
+        body = {
+            "monthly_investment": monthly_investment,
+            "years": years,
+            "portfolio_type": portfolio_type,
+        }
+        resp = self._make_request("POST", "/invest/dca", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/invest/dca"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def invest_grow(self, initial_amount: float, years: int = 10,
+                    rate_type: str = "conservative") -> Dict[str, Any]:
+        """Singapore compound growth comparator — CPF OA/SA vs SSB vs T-Bills vs StashAway."""
+        body = {
+            "initial_amount": initial_amount,
+            "years": years,
+            "rate_type": rate_type,
+        }
+        resp = self._make_request("POST", "/invest/grow", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/invest/grow"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def ssb_calculator(self, investment_amount: float, hold_until_year: int = 10) -> Dict[str, Any]:
+        """Singapore Savings Bonds calculator — maturity value, year-by-year breakdown."""
+        body = {
+            "investment_amount": investment_amount,
+            "hold_until_year": hold_until_year,
+        }
+        resp = self._make_request("POST", "/ssb/calculator", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/ssb/calculator"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def reit_analysis(self, reit_name: str) -> Dict[str, Any]:
+        """Singapore REIT analyzer — yields, sector, leverage, dividend coverage."""
+        body = {"reit_name": reit_name}
+        resp = self._make_request("POST", "/reit/analyze", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/reit/analyze"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    # ===== OTHER TOOLS =====
+
+    def coe_prices(self) -> Dict[str, Any]:
+        """Latest Singapore COE premiums for all 5 categories (A–E)."""
+        resp = self._make_request("POST", "/coe", {})
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/coe"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def car_loan(self, purchase_price: float, coe_premium: float, loan_amount: float,
+                 loan_tenure_years: int, interest_rate: float,
+                 car_age_years: int = 0) -> Dict[str, Any]:
+        """Singapore car loan + PARF calculator."""
+        body = {
+            "purchase_price": purchase_price,
+            "coe_premium": coe_premium,
             "loan_amount": loan_amount,
             "loan_tenure_years": loan_tenure_years,
             "interest_rate": interest_rate,
-            "existing_loan": existing_loan,
-        })
-    
-    def absd(self, citizenship: str, property_count: int,
-             is_buyer_edm: bool = False) -> dict:
-        """
-        ABSD (Additional Buyer's Stamp Duty) calculator.
-        
-        Args:
-            citizenship: 'singaporean', 'pr', 'foreigner', 'entity'
-            property_count: Number of properties owned (including the one being purchased)
-            is_buyer_edm: True if buying from developer (enjoys remission)
-        """
-        return self._make_request("POST", "/absd/calculator", {
-            "citizenship": citizenship,
-            "property_count": property_count,
-            "is_buyer_edm": is_buyer_edm,
-        })
-    
-    def condo_maintenance(self, property_type: str = "condo", floor_area: float = 100,
-                          storey: int = 15) -> dict:
-        """Estimate monthly condo maintenance fees (SGD psf basis)."""
-        return self._make_request("POST", "/condo/maintenance", {
-            "property_type": property_type,
-            "floor_area": floor_area,
-            "storey": storey,
-        })
-    
-    # =====================
-    # UTILITIES & SINGAPORE
-    # =====================
-    
-    def utilities_estimate(self, house_type: str = "hdb-4room",
-                           electricity_usage_kwh: float = 400) -> dict:
-        """Estimate monthly utilities (electricity, water, gas) for Singapore homes."""
-        return self._make_request("POST", "/utilities/estimate", {
-            "house_type": house_type,
-            "electricity_usage_kwh": electricity_usage_kwh,
-        })
-    
-    def electricity_compare(self, consumption_kwh: float = 400,
-                            tenure_months: int = 12) -> dict:
-        """Compare electricity plans across Singapore retailers (EMA data)."""
-        return self._make_request("POST", "/electricity/compare", {
-            "consumption_kwh": consumption_kwh,
-            "tenure_months": tenure_months,
-        })
-    
-    def school_nearby(self, postal_code: str, level: str = "primary",
-                       radius_km: float = 2.0) -> dict:
-        """
-        Find nearby schools (primary or secondary) by Singapore postal code.
-        Returns school names, distances, affiliation, and PSLE cutoff scores.
-        """
-        return self._make_request("POST", "/school/nearby", {
-            "postal_code": postal_code,
-            "level": level,
-            "radius_km": radius_km,
-        })
-    
-    def hawker_nearby(self, postal_code: str, radius_km: float = 1.0) -> dict:
-        """Find nearby hawker centres by Singapore postal code."""
-        return self._make_request("POST", "/hawker/nearby", {
-            "postal_code": postal_code,
-            "radius_km": radius_km,
-        })
-    
-    def holidays(self, year: int = 2026) -> dict:
-        """List Singapore public holidays for a given year."""
-        return self._make_request("GET", f"/holidays/singapore?year={year}", {})
-    
-    def coe_prices(self) -> dict:
-        """Latest COE premiums for each category (A/B/C/D/E/F) from LTA data."""
-        return self._make_request("GET", "/coe/prices", {})
-    
-    def car_loan(self, purchase_price: float = 100000,
-                 loan_amount: float = 80000, loan_tenure_months: int = 60,
-                 interest_rate: float = 2.78, coe_expiry_date: str = "2030-05-31") -> dict:
-        """CAR LOAN & PARF calculator — monthly repayment + PARF estimate."""
-        return self._make_request("POST", "/car/loan", {
-            "purchase_price": purchase_price,
-            "loan_amount": loan_amount,
-            "loan_tenure_months": loan_tenure_months,
-            "interest_rate": interest_rate,
-            "coe_expiry_date": coe_expiry_date,
-        })
-    
-    def goal_plan(self, goal_type: str, target_amount: float,
-                  current_savings: float = 0, monthly_contribution: float = 0,
-                  years_to_goal: int = 5) -> dict:
-        """
-        Personalized financial goal planner.
-        
-        goal_type: emergency_fund, home_down_payment, retirement, education, 
-                  wedding, car, vacation, investment, custom
-        """
-        return self._make_request("POST", "/goal/plan", {
-            "goal_type": goal_type,
-            "target_amount": target_amount,
-            "current_savings": current_savings,
-            "monthly_contribution": monthly_contribution,
-            "years_to_goal": years_to_goal,
-        })
-    
-    def business_lookup(self, uen: str) -> dict:
-        """Singapore UEN/Business profile lookup — entity name, type, status, address."""
-        return self._make_request("POST", "/business/lookup", {"uen": uen})
-    
-    def ssb_rates(self, year: int = 2026) -> dict:
-        """Singapore Savings Bond interest rates — latest MAS issue."""
-        return self._make_request("GET", f"/ssb/rates?year={year}", {})
-    
-    def ssb_calculator(self, investment_amount: float, hold_until_year: int = 10) -> dict:
-        """SSB maturity value calculator with year-by-year interest breakdown."""
-        return self._make_request("POST", "/ssb/calculator", {
-            "investment_amount": investment_amount,
-            "hold_until_year": hold_until_year,
-        })
-    
-    def retirement_community(self, location: str = "any",
-                              budget: int = 500000, flat_type: str = "2-room") -> dict:
-        """Find Singapore retirement communities (HDB, condo, landed)."""
-        return self._make_request("POST", "/retirement/community", {
-            "location": location,
-            "budget": budget,
-            "flat_type": flat_type,
-        })
-    
-    def financial_health_score(self, age: int, monthly_income: float,
-                               monthly_expenses: float, cpf_balance: float,
-                               investments: float = 0, debts: float = 0) -> dict:
-        """Singapore financial health score (0-100) with personalized recommendations."""
-        return self._make_request("POST", "/financial/health", {
-            "age": age,
+            "car_age_years": car_age_years,
+        }
+        resp = self._make_request("POST", "/car/loan", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/car/loan"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def savings_rates(self, min_balance: float = 1000, has_salary_credit: bool = True,
+                       bank_filter: str = None) -> Dict[str, Any]:
+        """Singapore savings account rate comparison."""
+        body = {
+            "min_balance": min_balance,
+            "has_salary_credit": has_salary_credit,
+        }
+        if bank_filter:
+            body["bank_filter"] = bank_filter
+        resp = self._make_request("POST", "/savings/rates", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/savings/rates"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def school_nearby(self, postal_code: str, level: str = "primary") -> Dict[str, Any]:
+        """Find nearby schools — primary/secondary, distance, PSLE cutoff."""
+        body = {"postal_code": postal_code, "level": level}
+        resp = self._make_request("POST", "/school/nearby", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/school/nearby"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def financial_health_score(self, monthly_income: float, monthly_expenses: float,
+                                total_debt: float, cpf_balance: float,
+                                emergency_fund: float = 0) -> Dict[str, Any]:
+        """Singapore financial health score + actionable recommendations."""
+        body = {
             "monthly_income": monthly_income,
             "monthly_expenses": monthly_expenses,
+            "total_debt": total_debt,
             "cpf_balance": cpf_balance,
-            "investments": investments,
-            "debts": debts,
-        })
-    
-    def forex_convert(self, from_currency: str, to_currency: str,
-                       amount: float) -> dict:
-        """Currency conversion using live forex rates."""
-        return self._make_request("POST", "/forex/convert", {
-            "from": from_currency,
-            "to": to_currency,
-            "amount": amount,
-        })
-    
-    def invoice(self, amount: float, currency: str = "SGD",
-                description: str = "", pay_to: str = "") -> dict:
-        """Generate a payment request / invoice using x402 protocol."""
-        return self._make_request("POST", "/invoice", {
-            "amount": amount,
-            "currency": currency,
-            "description": description,
-            "pay_to": pay_to,
-        })
-    
-    # =====================
-    # UTILITY
-    # =====================
-    
-    def health(self) -> dict:
-        """Check API health and available endpoints."""
-        return self._make_request("GET", "/health", {})
-    
-    def __repr__(self):
-        return f"<X402Financial base_url={self.base_url} version={self._version}>"
+            "emergency_fund": emergency_fund,
+        }
+        resp = self._make_request("POST", "/financial/health", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/financial/health"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
 
+    def invoice_parse(self, pdf_data: Union[str, bytes]) -> Dict[str, Any]:
+        """Parse Singapore GST invoice/receipt PDF — extract vendor, GST, total."""
+        if isinstance(pdf_data, bytes):
+            pdf_data = base64.b64encode(pdf_data).decode()
+        body = {"data": pdf_data}
+        resp = self._make_request("POST", "/invoice", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/invoice"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
 
-# ── Quick demo / test ──────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    print("x402 Financial Python Client")
-    print("=" * 50)
-    
-    client = X402Financial()
-    print(f"Auto-discovered API: {client.base_url}")
-    print(f"Version: {client.api_version}")
-    print(f"Endpoints available: {len(client.endpoints)}")
-    print()
-    print("Available methods:")
-    for name in sorted(dir(client)):
-        if not name.startswith('_') and callable(getattr(client, name)):
-            print(f"  .{name}(...)")
+    def holidays(self, year: int = None) -> Dict[str, Any]:
+        """List Singapore public holidays."""
+        params = {}
+        if year:
+            params["year"] = year
+        resp = self.session.get(f"{self.base_url}/holidays/singapore", params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def merchant_clean(self, raw_description: str) -> Dict[str, Any]:
+        """Clean a raw transaction description into normalized merchant name (FREE)."""
+        params = {"description": raw_description}
+        resp = self.session.get(f"{self.base_url}/merchant/clean", params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+
+    def batch_clean(self, descriptions: List[str]) -> Dict[str, Any]:
+        """Batch clean transaction descriptions — free for ≤20, $0.005 for 21–100."""
+        body = {"descriptions": descriptions}
+        resp = self._make_request("POST", "/merchant/batch-clean", body, include_payment=True)
+        return resp.json()
+
+    def forex_convert(self, amount: float, from_currency: str, to_currency: str = "SGD") -> Dict[str, Any]:
+        """Currency conversion with SGD base — travel money, forex comparison."""
+        body = {"amount": amount, "from": from_currency, "to": to_currency}
+        resp = self._make_request("POST", "/forex/convert", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/forex/convert"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def business_lookup(self, uen: str) -> Dict[str, Any]:
+        """Singapore UEN/ACRA business lookup."""
+        body = {"uen": uen}
+        resp = self._make_request("POST", "/business/lookup", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/business/lookup"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def benefits_check(self, age: int, employment_status: str = "employed") -> Dict[str, Any]:
+        """Singapore social benefits checker — CHAS, Pioneer/Generation, Medisave, GRC."""
+        body = {"age": age, "employment_status": employment_status}
+        resp = self._make_request("POST", "/benefits/check", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/benefits/check"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def utilities_estimate(self, property_type: str = "hdb_4room",
+                           occupancy: int = 4) -> Dict[str, Any]:
+        """Singapore utilities (electricity, water, gas) estimate — SP Group benchmarks."""
+        body = {"property_type": property_type, "occupancy": occupancy}
+        resp = self._make_request("POST", "/utilities/estimate", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/utilities/estimate"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def electricity_compare(self, monthly_kwh: float = 500,
+                           contract_type: str = "residential") -> Dict[str, Any]:
+        """Compare Singapore electricity plans — SP Group, Geneco, Senoko, etc."""
+        body = {"monthly_kwh": monthly_kwh, "contract_type": contract_type}
+        resp = self._make_request("POST", "/electricity/compare", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/electricity/compare"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
+
+    def goal_plan(self, goal_name: str, target_amount: float,
+                  monthly_savings: float, years: int) -> Dict[str, Any]:
+        """Personal savings goal planner — time to target, path to goal."""
+        body = {
+            "goal_name": goal_name,
+            "target_amount": target_amount,
+            "monthly_savings": monthly_savings,
+            "years": years,
+        }
+        resp = self._make_request("POST", "/goal/plan", body)
+        if resp.status_code == 402:
+            raise X402PaymentError("Payment required", required_amount=self._get_price("/goal/plan"), network=NETWORK, asset=ASSET)
+        resp.raise_for_status()
+        return resp.json()
