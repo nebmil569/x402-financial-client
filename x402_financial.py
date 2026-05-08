@@ -31,8 +31,8 @@ from typing import Optional, List, Dict, Any, Union
 # SECONDARY: Conway (v1.5.5, 43 prices, 14 endpoints behind)
 # TERTIARY: Vercel old (v1.5.7-rc1, 45 prices)
 BASE_URLS = [
-    "https://apinew-nine.vercel.app",  # PRIMARY — Vercel, 47 prices, all new endpoints
-    "https://x402-financial-api.life.conway.tech",  # SECONDARY — Conway stable
+    "https://x402-financial-api.life.conway.tech",  # PRIMARY — Conway, 70+ endpoints, v1.5.9
+    "https://apinew-nine.vercel.app",  # SECONDARY — Vercel, 47 prices, v1.5.8
     "https://x402-financial-data-api.vercel.app",  # TERTIARY — Vercel old
 ]
 NETWORK = "eip155:8453"
@@ -91,6 +91,12 @@ class X402Financial:
         else:
             self._wallet_seed = None
 
+        # Session must be created before _discover_endpoint (needs self.session)
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
+        if self._api_key:
+            self.session.headers["X-API-Key"] = self._api_key
+
         # Auto-discover or use override
         if base_url:
             self.base_url = base_url.rstrip("/")
@@ -99,16 +105,16 @@ class X402Financial:
             self.base_url = self._discover_endpoint()
             self._endpoint_version = "auto-discovered"
 
-        self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
-        if self._api_key:
-            self.session.headers["X-API-Key"] = self._api_key
-
         # Cache for endpoints
         self._endpoints_cache = None
 
     def _discover_endpoint(self) -> str:
-        """Auto-discover the best available API endpoint."""
+        """Auto-discover the best available API endpoint.
+        Prefers Conway (more endpoints, higher version) over Vercel.
+        """
+        # Conway always preferred (reliable, earns USDC directly). Bonus = 1,000,000 (beats any version number)
+        CONWAY_BONUS = 1000000
+        candidates = []
         for url in BASE_URLS:
             try:
                 resp = self.session.get(f"{url}/health", timeout=5)
@@ -116,10 +122,46 @@ class X402Financial:
                     data = resp.json()
                     version = data.get("version", "?")
                     prices_count = len(data.get("prices", {}))
-                    print(f"[x402-financial] Discovered {url} (v{version}, {prices_count} prices)")
-                    return url
-            except Exception:
+                    is_conway = 'conway' in url and 'origin-' not in url  # exclude internal container URLs
+                    try:
+                        v_parts = version.split(".")
+                        ver_num = int(v_parts[0])*10000 + int(v_parts[1])*100 + int(v_parts[2])
+                    except:
+                        ver_num = 0
+                    bonus = CONWAY_BONUS if is_conway else 0
+                    score = ver_num * 10000 + prices_count + bonus
+                    candidates.append((score, url, version, prices_count, is_conway))
+                    print(f"[x402-financial] Discovered {url} (v{version}, {prices_count} prices, score={score})")
+            except Exception as e:
+                print(f"[x402-financial] {url} unreachable: {e}")
                 continue
+        
+        if candidates:
+            # Sort by score descending
+            candidates.sort(reverse=True)
+            # Conway first: scan candidates and return the first LIVE Conway URL
+            for score, url, ver, count, is_conway in candidates:
+                if is_conway:
+                    try:
+                        resp = self.session.get(f"{url}/health", timeout=10)
+                        if resp.status_code == 200:
+                            print(f"[x402-financial] Selected (Conway preferred) {url} (v{ver}, {count} prices)")
+                            return url
+                    except:
+                        continue
+            # No live Conway — fall back to highest-score live URL
+            candidates.sort(reverse=True)  # ensure sorted
+            for score, url, ver, count, is_conway in candidates:
+                try:
+                    resp = self.session.get(f"{url}/health", timeout=10)
+                    if resp.status_code == 200:
+                        print(f"[x402-financial] Selected (fallback) {url} (v{ver}, {count} prices)")
+                        return url
+                except:
+                    continue
+            # Last resort
+            return BASE_URLS[0]
+        
         # Fallback to primary
         return BASE_URLS[0]
 
